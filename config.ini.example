@@ -1,0 +1,29 @@
+[moonshot]
+api_key = your-moonshot-api-key
+base_url = https://api.moonshot.ai/v1
+model = kimi-k2.5
+code_model = kimi-k2.5
+debug_model = kimi-k2.5
+max_tokens_prompt = 10000
+max_tokens_code = 10000
+max_tokens_fix = 10000
+
+[code_generation]
+temperature_prompt = 0.7
+temperature_code = 0.5
+temperature_fix = 0.3
+max_fix_attempts = 5
+execution_timeout = 60
+
+[rate_limit]
+max_requests_per_day = 2
+
+[flask]
+host = 0.0.0.0
+port = 5000
+debug = true
+secret_key = change-this-in-production
+
+[supabase]
+url = your-supabase-url
+key = your-supabase-key

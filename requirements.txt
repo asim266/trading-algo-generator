@@ -1,0 +1,18 @@
+# Web Framework
+flask==3.0.0
+werkzeug==3.0.1
+
+# AI APIs
+openai>=1.0.0
+anthropic>=0.37.0
+
+# Server
+gunicorn==21.2.0
+
+# Data & Trading
+pandas
+numpy
+backtesting==0.6.4
+requests==2.31.0
+backtrader
+matplotlib

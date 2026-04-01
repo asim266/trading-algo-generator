@@ -806,7 +806,11 @@ The prompt should be professional, precise, and focus on quantitative rules that
         // --- Card Toggle ---
         function toggleCard(header) { header.classList.toggle('collapsed'); }
 
-        // --- Form Submit ---
+        // --- Form Submit (Async with Polling) ---
+        let currentJobId = null;
+        let pollInterval = null;
+        let lastLogIndex = 0;
+
         document.getElementById('codeForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             const staticPrompt = document.getElementById('staticPrompt').value.trim();
@@ -820,10 +824,10 @@ The prompt should be professional, precise, and focus on quantitative rules that
             document.getElementById('progressSteps').classList.add('visible');
             resetSteps(); setStep(1, 'active');
 
-            // Open console drawer automatically
             if (!document.body.classList.contains('drawer-open')) toggleDrawer();
             clearConsole();
             addConsoleLine('Starting code generation...', 'info');
+            lastLogIndex = 0;
 
             try {
                 addConsoleLine('Sending request to server...', 'info');
@@ -840,38 +844,92 @@ The prompt should be professional, precise, and focus on quantitative rules that
                     })
                 });
 
-                let data;
-                try { data = await response.json(); } catch (parseErr) {
-                    addConsoleLine('Server timed out or returned invalid response.', 'error');
-                    showError('Request timed out. The AI model is slow — please try again.');
-                    return;
-                }
+                const data = await response.json();
 
                 if (response.status === 429) {
                     addConsoleLine('Rate limit exceeded!', 'error');
                     showError(data.error || 'Daily rate limit reached.');
                     document.getElementById('rateWarning').classList.add('visible');
-                    fetchRateLimit(); return;
+                    setLoadingState(false); fetchRateLimit(); return;
                 }
 
-                if (response.ok && data.success) {
-                    for (let i = 1; i <= 4; i++) setStep(i, 'done');
-                    addConsoleLine('Code generated and executed successfully!', 'success');
-                    displayResults(data);
-                } else if (response.ok && !data.success) {
-                    setStep(1, 'done'); setStep(2, 'done'); setStep(3, 'done'); setStep(4, 'active');
-                    addConsoleLine('Generation completed with errors.', 'warning');
-                    displayResults(data);
-                } else {
+                if (!response.ok || !data.job_id) {
                     addConsoleLine(`Error: ${data.error || 'Server error'}`, 'error');
                     showError(data.error || 'An error occurred.');
+                    setLoadingState(false); return;
                 }
-                fetchRateLimit();
+
+                // Start polling
+                currentJobId = data.job_id;
+                addConsoleLine(`Job started (${currentJobId}). Polling for progress...`, 'info');
+                pollInterval = setInterval(() => pollJobStatus(currentJobId), 3000);
+
             } catch (error) {
                 addConsoleLine(`Request failed: ${error.message}`, 'error');
-                showError('Request failed — server may have timed out. Please try again.');
-            } finally { setLoadingState(false); }
+                showError('Request failed. Please try again.');
+                setLoadingState(false);
+            }
         });
+
+        async function pollJobStatus(jobId) {
+            try {
+                const res = await fetch(`/job/${jobId}`);
+                const job = await res.json();
+
+                if (!res.ok) { stopPolling(); setLoadingState(false); return; }
+
+                // Update steps
+                const step = job.current_step || 1;
+                for (let i = 1; i < step; i++) setStep(i, 'done');
+                if (job.status === 'running') {
+                    setStep(step, 'active');
+                    // Update button text with status
+                    document.getElementById('btnText').textContent = job.step_status || 'Processing...';
+                }
+
+                // Stream new log entries
+                const logs = job.execution_log || [];
+                while (lastLogIndex < logs.length) {
+                    const entry = logs[lastLogIndex];
+                    const type = entry.toLowerCase().includes('success') ? 'success'
+                        : (entry.toLowerCase().includes('error') || entry.toLowerCase().includes('failed')) ? 'error'
+                        : entry.toLowerCase().includes('warning') ? 'warning' : 'info';
+                    addConsoleLine(entry, type);
+                    lastLogIndex++;
+                }
+
+                // Job complete or errored
+                if (job.status === 'complete' || job.status === 'error') {
+                    stopPolling();
+
+                    if (job.status === 'error') {
+                        addConsoleLine(`Error: ${job.error}`, 'error');
+                        showError(job.error || 'An error occurred.');
+                        setLoadingState(false);
+                        return;
+                    }
+
+                    if (job.success) {
+                        for (let i = 1; i <= 4; i++) setStep(i, 'done');
+                        addConsoleLine('Code generated and executed successfully!', 'success');
+                    } else {
+                        setStep(1, 'done'); setStep(2, 'done'); setStep(3, 'done'); setStep(4, 'active');
+                        addConsoleLine('Generation completed with errors.', 'warning');
+                    }
+                    displayResults(job);
+                    fetchRateLimit();
+                    setLoadingState(false);
+                }
+            } catch (err) {
+                // Network error during poll — don't stop, just retry
+                console.error('Poll error:', err);
+            }
+        }
+
+        function stopPolling() {
+            if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+            currentJobId = null;
+        }
 
         function setLoadingState(loading) {
             const btn = document.getElementById('generateBtn');

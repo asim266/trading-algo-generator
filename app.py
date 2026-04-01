@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import subprocess
 import tempfile
@@ -7,6 +8,8 @@ import logging
 import re
 import time
 import json
+import uuid
+import threading
 from datetime import date, datetime
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
@@ -220,7 +223,7 @@ def run_python_code(code):
 
         timeout = config.get_execution_timeout() if config.is_timeout_enabled() else None
         result = subprocess.run(
-            ['python', temp_filename],
+            [sys.executable, temp_filename],
             capture_output=True, text=True, timeout=timeout, cwd=os.getcwd()
         )
 
@@ -337,6 +340,136 @@ def upload_csv():
     size_mb = round(os.path.getsize(save_path) / (1024 * 1024), 1)
     return jsonify({'filename': safe_name, 'size_mb': size_mb})
 
+# --- Async Job System ---
+jobs = {}  # job_id -> job state dict
+jobs_lock = threading.Lock()
+
+def run_generation_job(job_id, static_prompt, auto_instruction, csv_file, provider, user_api_key, model, using_own_key):
+    """Run the full generation pipeline in a background thread."""
+    def update(step=None, step_status=None, log_msg=None):
+        with jobs_lock:
+            job = jobs[job_id]
+            if step is not None:
+                job['current_step'] = step
+            if step_status:
+                job['step_status'] = step_status
+            if log_msg:
+                job['execution_log'].append(log_msg)
+
+    try:
+        # Step 1: Generate strategy prompt
+        update(step=1, step_status='Generating strategy prompt...')
+        strategy_text, err = call_ai(
+            provider, user_api_key, model, STRATEGY_SYSTEM,
+            f"Generate a detailed, implementable trading strategy specification based on this instruction:\n\n{auto_instruction}\n\nOutput ONLY the strategy specification with numbered rules. No code, no markdown, just the precise trading rules."
+        )
+        if err or not strategy_text:
+            with jobs_lock:
+                jobs[job_id]['status'] = 'error'
+                jobs[job_id]['error'] = f'Strategy prompt generation failed: {err or "empty response"}'
+            return
+
+        with jobs_lock:
+            jobs[job_id]['strategy_prompt'] = strategy_text
+
+        # Step 2: Create final combined prompt
+        update(step=2, step_status='Creating final prompt...')
+        final_prompt = static_prompt.replace("[[csv_file]]", csv_file).replace("[[strategy_prompt]]", strategy_text)
+        with jobs_lock:
+            jobs[job_id]['final_prompt'] = final_prompt
+
+        # Step 3: Generate Python code
+        update(step=3, step_status='Generating Python code...')
+        code_text, err = call_ai(provider, user_api_key, model, CODE_SYSTEM, final_prompt)
+        if err or not code_text:
+            with jobs_lock:
+                jobs[job_id]['status'] = 'error'
+                jobs[job_id]['error'] = f'Code generation failed: {err or "empty response"}'
+            return
+
+        code = extract_code(code_text)
+
+        # Step 4: Run code and fix errors iteratively
+        update(step=4, step_status='Executing code...', log_msg='Starting execution...')
+        max_attempts = config.get_max_fix_attempts()
+        attempt = 0
+
+        while attempt < max_attempts:
+            attempt += 1
+            update(log_msg=f"--- Attempt {attempt}/{max_attempts} ---", step_status=f'Attempt {attempt}/{max_attempts}...')
+
+            success, output = run_python_code(code)
+
+            if success:
+                update(log_msg="Code executed successfully!")
+
+                timestamp = int(time.time())
+                final_filename = f"working_strategy_{timestamp}.py"
+                save_success, save_path = save_code_to_file(code, final_filename)
+
+                plot_html_content = None
+                plot_file_path = os.path.join(os.getcwd(), 'plot.html')
+                if os.path.exists(plot_file_path):
+                    try:
+                        with open(plot_file_path, 'r', encoding='utf-8') as f:
+                            plot_html_content = f.read()
+                        update(log_msg="plot.html generated and loaded")
+                    except Exception as e:
+                        update(log_msg=f"Error reading plot.html: {str(e)}")
+
+                _, remaining_after, total_after = check_rate_limit()
+
+                with jobs_lock:
+                    jobs[job_id].update({
+                        'status': 'complete',
+                        'success': True,
+                        'final_code': code,
+                        'output': output,
+                        'attempts': attempt,
+                        'local_filename': f"good_codes/{final_filename}" if save_success else None,
+                        'working_directory': os.getcwd(),
+                        'models_used': {'provider': provider, 'model': model},
+                        'plot_html': plot_html_content,
+                        'rate_limit': {'remaining': remaining_after, 'total': total_after}
+                    })
+                return
+            else:
+                update(log_msg=f"Runtime error: {output}")
+                if attempt < max_attempts:
+                    update(log_msg="Attempting to fix...", step_status=f'Fixing error (attempt {attempt})...')
+                    fix_prompt = f"Fix this Python code. The error and code are below.\n\nERROR:\n{output}\n\nCODE:\n{code}\n\nReturn ONLY the complete fixed Python code."
+                    fixed_text, fix_err = call_ai(provider, user_api_key, model, FIX_SYSTEM, fix_prompt)
+                    if fixed_text and fixed_text != code:
+                        code = extract_code(fixed_text)
+                        update(log_msg="Error fix attempted")
+                    else:
+                        update(log_msg=f"Could not fix: {fix_err or 'same code returned'}")
+                        break
+
+        update(log_msg=f"Could not resolve errors after {attempt} attempts")
+        _, remaining_after, total_after = check_rate_limit()
+
+        with jobs_lock:
+            jobs[job_id].update({
+                'status': 'complete',
+                'success': False,
+                'final_code': code,
+                'error': f"Could not resolve runtime errors after {attempt} attempts",
+                'attempts': attempt,
+                'working_directory': os.getcwd(),
+                'models_used': {'provider': provider, 'model': model},
+                'plot_html': None,
+                'rate_limit': {'remaining': remaining_after, 'total': total_after}
+            })
+
+    except Exception as e:
+        logger.error(f"Job {job_id} error: {str(e)}")
+        logger.error(traceback.format_exc())
+        with jobs_lock:
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['error'] = f'Server error: {str(e)}'
+
+
 @app.route('/generate', methods=['POST'])
 def generate():
     logger.info("New code generation request received")
@@ -347,13 +480,11 @@ def generate():
         auto_instruction = data.get('auto_instruction', '').strip()
         csv_file = data.get('csv_file', 'binance_solusdt_1h.csv').strip()
 
-        # Provider settings from user
         provider = data.get('provider', 'moonshot').strip()
         user_api_key = data.get('api_key', '').strip()
         model = data.get('model', '').strip()
         using_own_key = bool(user_api_key)
 
-        # If no user key, use server default (Moonshot) with rate limiting
         if not using_own_key:
             allowed, remaining, total = check_rate_limit()
             if not allowed:
@@ -361,14 +492,12 @@ def generate():
                     'error': f'Demo limit reached ({total}/{total}). Add your own API key for unlimited use.',
                     'rate_limited': True
                 }), 429
-            # Force to server default
             provider = 'moonshot'
             user_api_key = config.get_moonshot_api_key()
             if not model:
                 model = config.get_moonshot_model()
 
         if not model:
-            # Default model per provider
             models = PROVIDERS.get(provider, {}).get('models', [])
             model = models[0]['id'] if models else ''
 
@@ -380,108 +509,46 @@ def generate():
 
         logger.info(f"Provider: {provider}, Model: {model}, Own key: {using_own_key}")
 
-        # Step 1: Generate strategy prompt
-        logger.info("Step 1 - Generating strategy prompt")
-        strategy_text, err = call_ai(
-            provider, user_api_key, model, STRATEGY_SYSTEM,
-            f"Generate a detailed, implementable trading strategy specification based on this instruction:\n\n{auto_instruction}\n\nOutput ONLY the strategy specification with numbered rules. No code, no markdown, just the precise trading rules."
+        # Create async job
+        job_id = str(uuid.uuid4())[:8]
+        with jobs_lock:
+            jobs[job_id] = {
+                'status': 'running',
+                'current_step': 1,
+                'step_status': 'Starting...',
+                'strategy_prompt': None,
+                'final_prompt': None,
+                'execution_log': [],
+                'success': None,
+                'final_code': None,
+                'output': None,
+                'error': None,
+                'attempts': 0,
+                'plot_html': None,
+            }
+
+        thread = threading.Thread(
+            target=run_generation_job,
+            args=(job_id, static_prompt, auto_instruction, csv_file, provider, user_api_key, model, using_own_key),
+            daemon=True
         )
-        if err or not strategy_text:
-            return jsonify({'error': f'Strategy prompt generation failed: {err or "empty response"}'}), 500
+        thread.start()
 
-        # Step 2: Create final combined prompt
-        logger.info("Step 2 - Creating final combined prompt")
-        final_prompt = static_prompt.replace("[[csv_file]]", csv_file).replace("[[strategy_prompt]]", strategy_text)
-
-        # Step 3: Generate Python code
-        logger.info("Step 3 - Generating Python code")
-        code_text, err = call_ai(provider, user_api_key, model, CODE_SYSTEM, final_prompt)
-        if err or not code_text:
-            return jsonify({'error': f'Code generation failed: {err or "empty response"}'}), 500
-
-        code = extract_code(code_text)
-
-        # Step 4: Run code and fix errors iteratively
-        max_attempts = config.get_max_fix_attempts()
-        attempt = 0
-        execution_log = []
-        execution_log.append(f"Starting execution (max {max_attempts} attempts)...")
-
-        while attempt < max_attempts:
-            attempt += 1
-            execution_log.append(f"--- Attempt {attempt}/{max_attempts} ---")
-
-            success, output = run_python_code(code)
-
-            if success:
-                execution_log.append("Code executed successfully!")
-
-                timestamp = int(time.time())
-                final_filename = f"working_strategy_{timestamp}.py"
-                save_success, save_path = save_code_to_file(code, final_filename)
-
-                # Check for plot.html
-                plot_html_content = None
-                plot_file_path = os.path.join(os.getcwd(), 'plot.html')
-                if os.path.exists(plot_file_path):
-                    try:
-                        with open(plot_file_path, 'r', encoding='utf-8') as f:
-                            plot_html_content = f.read()
-                        execution_log.append("plot.html generated and loaded")
-                    except Exception as e:
-                        execution_log.append(f"Error reading plot.html: {str(e)}")
-
-                _, remaining_after, total_after = check_rate_limit()
-
-                return jsonify({
-                    'success': True,
-                    'strategy_prompt': strategy_text,
-                    'final_prompt': final_prompt,
-                    'final_code': code,
-                    'execution_log': execution_log,
-                    'output': output,
-                    'attempts': attempt,
-                    'local_filename': f"good_codes/{final_filename}" if save_success else None,
-                    'working_directory': os.getcwd(),
-                    'models_used': {'provider': provider, 'model': model},
-                    'plot_html': plot_html_content,
-                    'rate_limit': {'remaining': remaining_after, 'total': total_after}
-                })
-            else:
-                execution_log.append(f"Runtime error: {output}")
-                if attempt < max_attempts:
-                    execution_log.append("Attempting to fix...")
-                    fix_prompt = f"Fix this Python code. The error and code are below.\n\nERROR:\n{output}\n\nCODE:\n{code}\n\nReturn ONLY the complete fixed Python code."
-                    fixed_text, fix_err = call_ai(provider, user_api_key, model, FIX_SYSTEM, fix_prompt)
-                    if fixed_text and fixed_text != code:
-                        code = extract_code(fixed_text)
-                        execution_log.append("Error fix attempted")
-                    else:
-                        execution_log.append(f"Could not fix: {fix_err or 'same code returned'}")
-                        break
-
-        execution_log.append(f"Could not resolve errors after {attempt} attempts")
-        _, remaining_after, total_after = check_rate_limit()
-
-        return jsonify({
-            'success': False,
-            'strategy_prompt': strategy_text,
-            'final_prompt': final_prompt,
-            'final_code': code,
-            'execution_log': execution_log,
-            'error': f"Could not resolve runtime errors after {attempt} attempts",
-            'attempts': attempt,
-            'local_filename': None,
-            'working_directory': os.getcwd(),
-            'models_used': {'provider': provider, 'model': model},
-            'plot_html': None,
-            'rate_limit': {'remaining': remaining_after, 'total': total_after}
-        })
+        return jsonify({'job_id': job_id, 'status': 'started'})
 
     except Exception as e:
         logger.error(f"Server error: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'error': f'Server error: {str(e)}'}), 500
+
+
+@app.route('/job/<job_id>', methods=['GET'])
+def job_status(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
 
 if __name__ == '__main__':
     logger.info("Starting Trading Algo Generator...")
